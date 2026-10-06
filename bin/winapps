@@ -59,6 +59,7 @@ HIDEF="on"
 RDP_FLATPAK=0
 RDP_FLAGS_WINDOWS=""
 RDP_FLAGS_NON_WINDOWS=""
+RDP_MONITOR_ORDER="auto"
 
 # OTHER
 FREERDP_PID=-1
@@ -303,6 +304,91 @@ function waFixRemovableMedia() {
     fi
 }
 
+# Name: 'waFixMonitorOrder'
+# Role: Work around a FreeRDP multi-monitor coordinate bug in RemoteApp (RAIL) mode.
+#
+# FreeRDP anchors the remote desktop origin on the *primary* monitor:
+# freerdp_settings_set_monitor_def_array_sorted() sets MonitorLocalShiftX/Y to
+# primary->x/y and shifts every other monitor by that amount. When the local
+# primary is not the left-most monitor, each monitor to its left is transmitted
+# with a negative 'left' coordinate. Windows cannot represent a desktop origin
+# with negative coordinates, so it normalises the layout while the client keeps
+# applying the original shift. The two disagree by one monitor width, so
+# RemoteApp windows receive mouse events offset from where they are drawn:
+# clicks stop registering once a window is dragged across a screen seam.
+#
+# Making the left-most monitor the RDP primary keeps every transmitted
+# coordinate non-negative and restores correct hit-testing. This is normally a
+# manual '/monitors:<order>' flag; deriving it here removes the per-user step.
+#
+# Controlled by $RDP_MONITOR_ORDER (set in winapps.conf):
+#   "auto" (default)  - derive the order from 'xrandr --listmonitors'
+#   ""                - disabled, leave the command line untouched
+#   "2,1,0"           - use these monitor ids, left-most first
+#
+# Only $RDP_FLAGS_NON_WINDOWS (the RemoteApp launch paths) is modified, so the
+# full-desktop 'windows' path keeps its existing behaviour.
+function waFixMonitorOrder() {
+    # Disabled: the user explicitly turned the workaround off.
+    [ -z "$RDP_MONITOR_ORDER" ] && return 0
+
+    # Respect an order the user already supplied by hand.
+    [[ "${RDP_FLAGS} ${RDP_FLAGS_NON_WINDOWS}" == *"/monitors"* ]] && return 0
+
+    local order=""
+    if [ "$RDP_MONITOR_ORDER" != "auto" ]; then
+        # Explicit monitor id list supplied by the user, e.g. "2,1,0".
+        # Tolerate the "/monitors:" prefix being included, so both forms work.
+        order="${RDP_MONITOR_ORDER#/monitors:}"
+    else
+        # Nothing to derive without xrandr (non-X11 session).
+        command -v xrandr &>/dev/null || return 0
+
+        local rows nmonitors leftmost_is_primary
+        # Emit "<x_origin> <index> <is_primary>" per monitor.
+        # Input line:  " 0: +*HDMI-1 1920/700x1080/400+1920+0  HDMI-1"
+        #   field 1 = "0:"         (monitor index)
+        #   field 2 = "+*HDMI-1"  ('*' marks the primary)
+        #   field 3 = "...+1920+0" (geometry; the only field that splits into
+        #                                    3+ parts on '+')
+        # The n >= 3 guard matters: "+*HDMI-1" also contains '+' but yields only
+        # 2 parts, and a[2]="*HDMI-1" would coerce to 0 and report the wrong
+        # monitor as left-most.
+        rows="$(xrandr --listmonitors 2>/dev/null | awk '
+            NR > 1 && NF >= 3 {
+                idx = $1; sub(/:$/, "", idx)
+                primary = ($2 ~ /\*/) ? 1 : 0
+                for (i = 1; i <= NF; i++) {
+                    if ($i ~ /\+/) {
+                        n = split($i, a, "+")
+                        if (n >= 3) { print a[2] + 0, idx, primary; break }
+                    }
+                }
+            }')"
+
+        [ -z "$rows" ] && return 0
+
+        # A single monitor can never be mis-ordered.
+        nmonitors="$(printf '%s\n' "$rows" | wc -l | tr -d ' ')"
+        [ "$nmonitors" -le 1 ] && return 0
+
+        # If the primary is already the left-most monitor the layout is correct.
+        leftmost_is_primary="$(printf '%s\n' "$rows" | sort -n -k1,1 | awk 'NR == 1 { print $3 }')"
+        if [ "$leftmost_is_primary" = "1" ]; then
+            dprint "MONITOR_ORDER: primary is already left-most, no reorder needed"
+            return 0
+        fi
+
+        # Order the ids left-to-right so the left-most monitor becomes primary.
+        order="$(printf '%s\n' "$rows" | sort -n -k1,1 | awk '{ printf "%s%s", (NR > 1 ? "," : ""), $2 }')"
+    fi
+
+    [ -z "$order" ] && return 0
+
+    RDP_FLAGS_NON_WINDOWS="${RDP_FLAGS_NON_WINDOWS} +multimon /monitors:${order}"
+    dprint "MONITOR_ORDER: primary is not left-most, using '+multimon /monitors:${order}'"
+}
+
 # Name: 'waHelp'
 # Role: Print usage information.
 function waHelp() {
@@ -378,6 +464,8 @@ function waLoadConfig() {
     waFixScale
     # Update when $REMOVABLE_MEDIA is null
     waFixRemovableMedia
+    # Update $RDP_FLAGS_NON_WINDOWS for multi-monitor RemoteApp.
+    waFixMonitorOrder
     # Update $AUTOPAUSE_TIME.
     # RemoteApp RDP sessions take, at minimum, 20 seconds to be terminated by the Windows server.
     # Hence, subtract 20 from the timeout specified by the user, as a 'built in' timeout of 20 seconds will occur.
